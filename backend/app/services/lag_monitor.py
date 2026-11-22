@@ -1,9 +1,19 @@
-"""延迟监控服务：采集延迟数据后级联告警和健康评估。"""
+"""延迟监控服务：采集延迟数据后级联告警和健康评估。
+
+延迟来源（维表缓存失效 / 监控采样）统一归集到 lag_source 的延迟来源明细，
+本服务只负责登记监控采样来源，并消费来源明细生成实时延迟告警和健康评估。
+"""
 from __future__ import annotations
 
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.lag_source import (
+    SOURCE_SAMPLING,
+    STEP_ALERT,
+    STEP_HEALTH,
+    lag_source_service,
+)
 from app.store import store
 
 
@@ -46,49 +56,62 @@ class LagMonitorService(BaseModuleService):
 
         return result
 
-    def escalate_to_alert_and_health(self, entry_id: int) -> dict[str, Any] | None:
-        """延迟达到告警阈值后，触发告警规则和健康评估。
+    def record_sampling_observation(
+        self, entry_id: int, *, lag_status: str | None = None
+    ) -> dict[str, Any] | None:
+        """监控采样报出新的延迟状态（如独立严重滞后）时，登记一笔监控采样来源观测。
 
-        数据流链路: lag_monitor -> alert_rule + stream_health
+        采样观测与缓存失效观测在共用归集中各自独立、同数据流互不覆盖；
+        来源定位到触发时的采样指标和位点。
         """
         entry = self.get_entry(entry_id)
         if entry is None:
             return None
 
-        tag = str(entry.get("数据流", ""))
-        results: dict[str, Any] = {"alert": None, "health": None}
+        if lag_status is not None and entry.get("status") != lag_status:
+            entry["status"] = lag_status
+            entry["pending"] = True
+            entry["abnormal"] = lag_status in ("延迟偏高", "严重滞后")
 
-        if entry.get("status") in ("严重滞后", "延迟偏高"):
-            # 创建告警
-            alert_rows = store.rows("alert_rule")
-            new_alert_id = max((int(r.get("id", 0)) for r in alert_rows), default=0) + 1
-            severity = "P1-紧急" if entry.get("status") == "严重滞后" else "P2-警告"
-            alert = {
-                "id": new_alert_id,
-                "策略编号": f"ALER-{new_alert_id:04d}",
-                "监控指标": "实时延迟",
-                "告警条件": f"延迟 > {entry.get('告警阈值', '30s')}",
-                "告警级别": severity,
-                "通知渠道": "飞书群+电话",
-                "聚合窗口": "1min",
-                "静默时段": "无",
-                "触发次数": 5,
-                "status": "已触发",
-                "pending": True,
-                "abnormal": True,
-            }
-            alert_rows.append(alert)
-            results["alert"] = alert
+        return lag_source_service.register_observation(
+            source_type=SOURCE_SAMPLING,
+            data_stream=str(entry.get("数据流", "")),
+            lag_seconds=entry.get("延迟秒数"),
+            lag_status=str(entry.get("status")),
+            threshold=str(entry.get("告警阈值", "30s")),
+            sample_time=str(entry.get("最近采样", "")),
+            lag_row_id=entry_id,
+            source_ref_id=entry_id,
+            source_ref_code=str(entry.get("指标编号", "")),
+            source_basis={
+                "模块": self.MODULE,
+                "指标编号": entry.get("指标编号"),
+                "数据流": entry.get("数据流"),
+                "源端位点": entry.get("源端位点"),
+                "处理位点": entry.get("处理位点"),
+                "延迟秒数": entry.get("延迟秒数"),
+                "告警阈值": entry.get("告警阈值"),
+                "最近采样": entry.get("最近采样"),
+                "采样间隔": entry.get("采样间隔"),
+            },
+        )
 
-        # 触发健康评估
+    def _ensure_observation(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """取指标对应的来源观测；旧入口没有观测时按当前采样补登记一笔。"""
+        obs = lag_source_service.find_for_lag_row(int(entry.get("id", 0)))
+        if obs is None:
+            obs = self.record_sampling_observation(int(entry.get("id", 0)))
+        return obs
+
+    def _legacy_health(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """正常采样观测无待处置步骤时，沿用旧口径补一份健康评估，保持返回字段不变。"""
         health_rows = store.rows("stream_health")
         new_health_id = max((int(r.get("id", 0)) for r in health_rows), default=0) + 1
-        score = 45 if entry.get("status") == "严重滞后" else 72
         health = {
             "id": new_health_id,
             "评估编号": f"STRE-{new_health_id:04d}",
-            "数据流": tag,
-            "健康分数": score,
+            "数据流": str(entry.get("数据流", "")),
+            "健康分数": 72,
             "风险项": "高延迟+水位堆积",
             "修复建议": "扩容处理节点+扩大乱序窗口",
             "评估时间": "2026-11-18 10:40:00",
@@ -99,6 +122,37 @@ class LagMonitorService(BaseModuleService):
             "abnormal": True,
         }
         health_rows.append(health)
-        results["health"] = health
+        return health
+
+    def escalate_to_alert_and_health(self, entry_id: int) -> dict[str, Any] | None:
+        """延迟达到告警阈值后，消费延迟来源明细触发告警规则和健康评估。
+
+        数据流链路: lag_source(延迟来源明细) -> alert_rule + stream_health
+        告警条件、级别与健康评分沿用原口径；处置按观测分步推进、幂等可续办，
+        已生成的告警和评估始终指向当时登记的来源观测。
+        """
+        entry = self.get_entry(entry_id)
+        if entry is None:
+            return None
+
+        obs = self._ensure_observation(entry)
+        results: dict[str, Any] = {"alert": None, "health": None}
+
+        if not lag_source_service.pending_steps(obs):
+            # 无待处置步骤（正常采样，或该观测已处置完成）：不重复产出。
+            # 正常指标的旧入口口径仍会返回一份健康评估。
+            if entry.get("status") not in ("严重滞后", "延迟偏高"):
+                results["health"] = self._legacy_health(entry)
+            return results
+
+        # 消费共用延迟来源明细：逐步执行该观测剩余处置，中断后续办不会重复写。
+        while True:
+            step_result = lag_source_service.run_next_step(int(obs["id"]))
+            if step_result is None:
+                break
+            if step_result["step"] == STEP_ALERT:
+                results["alert"] = step_result["output"]
+            elif step_result["step"] == STEP_HEALTH:
+                results["health"] = step_result["output"]
 
         return results

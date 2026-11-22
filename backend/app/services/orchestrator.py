@@ -18,6 +18,7 @@ from app.services.checkpoint import CheckpointService
 from app.services.iceberg_commit import IcebergCommitService
 from app.services.compaction import CompactionService
 from app.services.ddl_handle import DdlHandleService
+from app.services.lag_source import lag_source_service
 
 
 cdc_source = CdcSourceService()
@@ -104,14 +105,15 @@ def flow_lag_recovery(cdc_entry_id: int) -> dict[str, Any]:
             if lm:
                 trace.append(f"out_of_order#{ooo['id']} -> lag_monitor#{lm['id']}")
 
-    # 2. 延迟监控 → 告警 + 健康
-    for lm in store.rows("lag_monitor"):
-        if lm.get("status") in ("严重滞后", "延迟偏高"):
-            result = lag_monitor.escalate_to_alert_and_health(lm["id"])
-            if result and result.get("alert"):
-                trace.append(f"lag_monitor#{lm['id']} -> alert_rule#{result['alert']['id']}")
-            if result and result.get("health"):
-                trace.append(f"lag_monitor#{lm['id']} -> stream_health#{result['health']['id']}")
+    # 2. 延迟监控 -> 告警 + 健康：消费共用延迟来源明细，一轮只处置一笔观测
+    handled = lag_source_service.run_next_observation()
+    if handled:
+        obs = handled["observation"]
+        anchor = f"lag_source#{obs['id']}"
+        if handled.get("alert"):
+            trace.append(f"{anchor} -> alert_rule#{handled['alert']['id']}")
+        if handled.get("health"):
+            trace.append(f"{anchor} -> stream_health#{handled['health']['id']}")
 
     # 3. ..checkpoint恢复 → 水位重置 + 回填
     for cp in store.rows("checkpoint"):
@@ -166,7 +168,7 @@ def flow_commit_failure_recovery(commit_entry_id: int) -> dict[str, Any]:
 
 
 def flow_cache_invalidation(dim_entry_id: int) -> dict[str, Any]:
-    """主线链路5: 维表缓存失效→告警→延迟指标
+    """主线链路5: 维表缓存失效→告警→延迟来源明细
 
     调用数: 3+
     """
@@ -180,8 +182,90 @@ def flow_cache_invalidation(dim_entry_id: int) -> dict[str, Any]:
         trace.append(f"dim_join#{dim_entry_id} -> alert_rule#{result['alert']['id']}")
     if result.get("lag"):
         trace.append(f"dim_join#{dim_entry_id} -> lag_monitor#{result['lag']['id']}")
+    if result.get("lag_source"):
+        trace.append(
+            f"dim_join#{dim_entry_id} -> lag_source#{result['lag_source']['id']}"
+        )
 
     return {"ok": True, "trace": trace, "call_count": len(trace)}
+
+
+def flow_lag_source_pending(
+    data_stream: str | None = None, sample_time: str | None = None
+) -> dict[str, Any]:
+    """按数据流/原采样查询仍待完成处置的延迟来源观测（编排中断后的核对入口）。"""
+    observations = lag_source_service.list_observations(
+        data_stream=data_stream, sample_time=sample_time, only_pending=True
+    )
+    items: list[dict[str, Any]] = []
+    for obs in observations:
+        items.append({
+            "observation": obs,
+            "pending_dispositions": lag_source_service.pending_dispositions(int(obs["id"])),
+        })
+    return {"ok": True, "data_stream": data_stream, "sample_time": sample_time,
+            "pending_count": len(items), "items": items}
+
+
+def flow_lag_source_resume(observation_id: int) -> dict[str, Any]:
+    """续办：按观测把仍待完成的处置继续跑完，已完成的告警/评估不重复产出。"""
+    obs = lag_source_service.get_observation(observation_id)
+    if obs is None:
+        return {"ok": False, "step": "lag_source", "message": "延迟来源观测不存在"}
+
+    trace: list[str] = []
+    while True:
+        step_result = lag_source_service.run_next_step(observation_id)
+        if step_result is None:
+            break
+        if step_result.get("skipped"):
+            continue
+        output = step_result.get("output") or {}
+        target_module = (
+            "alert_rule" if step_result["step"] == "实时延迟告警" else "stream_health"
+        )
+        trace.append(
+            f"lag_source#{observation_id} -> {target_module}#{output.get('id')}"
+        )
+
+    refreshed = lag_source_service.get_observation(observation_id)
+    return {
+        "ok": True,
+        "trace": trace,
+        "call_count": len(trace),
+        "observation": refreshed,
+        "pending_dispositions": lag_source_service.pending_dispositions(observation_id),
+    }
+
+
+def flow_lag_source_step(observation_id: int) -> dict[str, Any]:
+    """最小粒度推进一笔观测的下一个处置步骤，用于模拟实时告警写入后中断。"""
+    obs = lag_source_service.get_observation(observation_id)
+    if obs is None:
+        return {"ok": False, "step": "lag_source", "message": "延迟来源观测不存在"}
+
+    step_result = lag_source_service.run_next_step(observation_id)
+    if step_result is None:
+        return {"ok": False, "step": "lag_source", "message": "该观测没有待处置步骤"}
+
+    output = step_result.get("output") or {}
+    return {
+        "ok": True,
+        "step": step_result["step"],
+        "output": output,
+        "observation": lag_source_service.get_observation(observation_id),
+        "pending_dispositions": lag_source_service.pending_dispositions(observation_id),
+    }
+
+
+def flow_record_sampling(lag_entry_id: int, lag_status: str) -> dict[str, Any]:
+    """延迟监控报出独立采样观测（如严重滞后），登记到共用延迟来源明细。"""
+    observation = lag_monitor.record_sampling_observation(
+        lag_entry_id, lag_status=lag_status
+    )
+    if observation is None:
+        return {"ok": False, "step": "lag_monitor", "message": "延迟指标不存在"}
+    return {"ok": True, "observation": observation}
 
 
 def flow_out_of_order_to_checkpoint(ooo_entry_id: int) -> dict[str, Any]:

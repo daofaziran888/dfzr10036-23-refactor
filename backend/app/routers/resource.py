@@ -156,6 +156,39 @@ def trigger_flow_sink_block_to_compaction(sink_entry_id: int) -> dict[str, Any]:
     return flow_sink_block_to_compaction(sink_entry_id)
 
 
+# ---- 延迟来源明细：来源查询、中断续办、分步处置与监控采样入口 ----
+
+@router.get("/flows/lag-sources/pending")
+def query_lag_source_pending(
+    data_stream: str | None = Query(default=None),
+    sample_time: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """按数据流/原采样查询仍待完成处置的延迟来源观测。"""
+    from app.services.orchestrator import flow_lag_source_pending
+    return flow_lag_source_pending(data_stream=data_stream, sample_time=sample_time)
+
+
+@router.post("/flows/lag-sources/{observation_id}/resume")
+def resume_lag_source(observation_id: int) -> dict[str, Any]:
+    """按观测续办仍待完成的处置（实时延迟告警/健康评估）。"""
+    from app.services.orchestrator import flow_lag_source_resume
+    return flow_lag_source_resume(observation_id)
+
+
+@router.post("/flows/lag-sources/{observation_id}/step")
+def step_lag_source(observation_id: int) -> dict[str, Any]:
+    """只推进一笔观测的下一个处置步骤（用于实时告警写入后中断的场景）。"""
+    from app.services.orchestrator import flow_lag_source_step
+    return flow_lag_source_step(observation_id)
+
+
+@router.post("/flows/lag-monitor/{lag_entry_id}/sampling")
+def record_lag_sampling(lag_entry_id: int, lag_status: str) -> dict[str, Any]:
+    """延迟监控报出独立采样观测（延迟偏高/严重滞后），写入共用延迟来源明细。"""
+    from app.services.orchestrator import flow_record_sampling
+    return flow_record_sampling(lag_entry_id, lag_status)
+
+
 @router.get("/flows/list")
 def list_flows() -> dict[str, Any]:
     """列出所有可编排流链路"""
